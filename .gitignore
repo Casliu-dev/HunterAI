@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Ambiente
+.env
+.env.local
+*.local
+
+# Uploads e modelos baixados
+storage/
+.cache/huggingface/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
