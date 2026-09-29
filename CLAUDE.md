@@ -57,27 +57,42 @@ injustamente. Mesma funcionalidade, sem risco de encerramento da conta Stripe.
 ## Estrutura
 
 ```
-apps/api/app/
-├── main.py              FastAPI app, CORS, /health
-├── core/                config, db, security (JWT/bcrypt), deps
-├── models/              SQLAlchemy: user, billing, job
-├── schemas/             Pydantic I/O
-├── api/v1/              routers
-├── services/            regra de negócio (credits, humanizer, detector, …)
-└── worker/              Celery
+apps/api/
+├── alembic.ini          script_location=alembic, prepend_sys_path=.
+├── alembic/
+│   ├── env.py           URL vem de settings, não do .ini
+│   └── versions/        0001 = schema inicial
+└── app/
+    ├── main.py          FastAPI app, CORS, /health
+    ├── core/            config, db, security (JWT/bcrypt), deps
+    ├── models/          SQLAlchemy: user, billing, job
+    ├── schemas/         Pydantic I/O
+    ├── api/v1/          routers
+    ├── services/        regra de negócio (credits, humanizer, detector, …)
+    └── worker/          Celery
 apps/web/                (ainda não criado)
 ```
 
 ## Ambiente desta máquina — ATENÇÃO
 
-Não há **Python** nem **Docker** instalados. Há Node 24, npm 11 e git.
-Para rodar o backend é preciso um dos dois:
+Node 24, npm 11, git e **Python 3.12.10** (`%LOCALAPPDATA%\Programs\Python\Python312`).
+Venv do backend em `apps/api/.venv` (ignorada pelo git), com o projeto instalado
+em modo editável. **Não há Docker, Postgres nem Redis.**
 
-- **Docker Desktop** (recomendado — o `docker-compose.yml` sobe postgres, redis,
-  api e worker de uma vez), ou
-- **Python 3.12** local + Postgres + Redis por fora.
+Cuidado: o `py` sozinho não basta — o Python Launcher é só um localizador, o
+runtime é o pacote `Python.Python.3.12`. E após instalar algo no PATH, o Claude
+Code precisa reiniciar para enxergar; até lá, chame pelo caminho absoluto.
 
-Nenhum comando Python foi executado ainda; o código não foi testado em runtime.
+```bash
+cd apps/api
+./.venv/Scripts/python.exe -m alembic upgrade head --sql   # não conecta no banco
+./.venv/Scripts/python.exe -m ruff check .
+```
+
+Sem Postgres, o que dá para validar offline é: import da app, `--sql` de
+upgrade/downgrade, ruff, e a paridade models↔migration (comparando o DDL de
+`CreateTable` compilado no dialeto PG contra a saída do `--sql`). O que **não**
+dá: `alembic check`, qualquer teste que toque o banco, e o Celery.
 
 ## Estado atual
 
@@ -88,19 +103,20 @@ Nenhum comando Python foi executado ainda; o código não foi testado em runtime
 - `schemas/auth.py`, `services/credits.py`
 - `api/v1/auth.py`: signup, login, refresh (com rotação), logout, me
 - `main.py` + `/health`
+- **Alembic**: `alembic.ini`, `alembic/env.py`, `script.py.mako` e a migration
+  inicial `0001` (as seis tabelas). Validada offline: o DDL gerado bate 1:1 com
+  o dos models (16 statements), upgrade e downgrade compilam, ruff limpo. Ainda
+  **não foi aplicada em banco de verdade** — falta rodar contra o Postgres.
 
 **Falta**
-1. **Alembic** — `alembic.ini`, `alembic/env.py` e a migration inicial. Nada foi
-   gerado ainda; o `docker-compose` já chama `alembic upgrade head` e vai falhar
-   sem isso. *Este é o próximo passo.*
-2. `services/extract.py` — `.docx` / `.pdf` / `.txt` → texto
-3. `services/sanitize.py` — limpeza de vestígios do arquivo (ver abaixo)
-4. `services/humanizer.py` — pipeline de reescrita com Claude
-5. `services/detector.py` — perplexidade + burstiness
-6. `worker/` — Celery app e tasks
-7. `api/v1/`: documents, humanize, detect, billing (webhook Stripe)
-8. `apps/web/` — dashboard React inteiro
-9. Testes
+1. `services/extract.py` — `.docx` / `.pdf` / `.txt` → texto. *Próximo passo.*
+2. `services/sanitize.py` — limpeza de vestígios do arquivo (ver abaixo)
+3. `services/humanizer.py` — pipeline de reescrita com Claude
+4. `services/detector.py` — perplexidade + burstiness
+5. `worker/` — Celery app e tasks
+6. `api/v1/`: documents, humanize, detect, billing (webhook Stripe)
+7. `apps/web/` — dashboard React inteiro
+8. Testes
 
 ### Notas de implementação para o que falta
 
@@ -125,3 +141,38 @@ trechos destacados — **nunca** um veredito binário.
 - Mensagens de erro de auth nunca revelam se o e-mail existe.
 - `ruff` com `line-length = 100`.
 - Migrations sempre via Alembic — nada de `Base.metadata.create_all()`.
+
+### Migrations
+
+Rodar de dentro de `apps/api/` (ou de `/app` no container, é o mesmo diretório):
+
+```bash
+alembic upgrade head                        # aplicar
+alembic revision --autogenerate -m "msg"    # criar a partir dos models
+alembic check                               # models e banco divergem?
+alembic upgrade head --sql                  # só imprime o SQL, não conecta
+```
+
+- A `DATABASE_URL` é lida pelo `env.py` de `settings`, **não** do `alembic.ini`
+  — senha não vai para o git, e `%` na senha não quebra a interpolação do ini.
+- `env.py` importa de `app.models` (o `__init__`), não de `app.models.base`:
+  importar só a `Base` deixaria o metadata vazio e o autogenerate mudo.
+- Ao criar um model novo, exporte-o em `app/models/__init__.py` — é o que o
+  autogenerate enxerga.
+- Sempre **revise** o arquivo gerado: o autogenerate não detecta rename de
+  coluna (vira drop + add, perde dado) nem mudança de `server_default` em tipo.
+
+### Três ajustes no `pyproject.toml` que não devem ser revertidos
+
+Os três vieram de falhas reais encontradas ao rodar o projeto pela primeira vez;
+o diretório `alembic/` na raiz é a causa de dois deles.
+
+1. `[tool.setuptools.packages.find] include = ["app*"]` — sem isso o setuptools
+   vê `app/` e `alembic/` como dois pacotes top-level e **aborta o build**. Isso
+   quebrava o `pip install -e .` do Dockerfile também.
+2. `pydantic[email]` — `schemas/auth.py` usa `EmailStr`, que exige o
+   `email-validator`. Sem o extra, o import de `app.main` levanta ImportError e
+   a API não sobe.
+3. `[tool.ruff.lint.isort] known-third-party = ["alembic"]` — sem isso o ruff
+   confunde o diretório `alembic/` com o pacote e quer agrupar
+   `from alembic import op` junto de `app.*`, em toda migration.

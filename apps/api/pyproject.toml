@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hunterai-api"
 version = "0.1.0"
@@ -5,7 +9,9 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "pydantic>=2.9",
+    # [email] traz o email-validator, exigido pelo EmailStr de schemas/auth.py.
+    # Sem o extra, o import de app.main quebra e a API não sobe.
+    "pydantic[email]>=2.9",
     "pydantic-settings>=2.6",
     "sqlalchemy>=2.0.36",
     "alembic>=1.14",
@@ -33,9 +39,20 @@ dev = [
     "ruff>=0.7",
 ]
 
+# Sem isto o setuptools enxerga `app/` e `alembic/` como dois pacotes top-level
+# e aborta o build ("Multiple top-level packages discovered in a flat-layout").
+# `alembic/` é script de migration, não faz parte do pacote distribuído.
+[tool.setuptools.packages.find]
+include = ["app*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+# O diretório `alembic/` faz o ruff achar que `alembic` é código nosso e
+# agrupar `from alembic import op` junto de `app.*`. É biblioteca de terceiro.
+known-third-party = ["alembic"]
