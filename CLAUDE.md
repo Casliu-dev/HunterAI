@@ -101,6 +101,23 @@ dá: `alembic check`, qualquer teste que toque o banco, e o Celery.
 - `core/`: config (pydantic-settings), db (sessão por request), security, deps
 - `models/`: User, RefreshToken, Subscription, CreditLedger, Document, Job
 - `schemas/auth.py`, `services/credits.py`
+- `services/extract.py` — `.docx`/`.pdf`/`.txt` → texto em parágrafos separados por
+  linha em branco. Tipo detectado pelos bytes, não pela extensão. `count_words()`
+  mora aqui e é a contagem oficial de crédito. Testes em `tests/test_extract.py`
+  (não tocam o banco: `python -m pytest tests`).
+- `services/sanitize.py` — `sanitize_text()` (invisíveis, espaços especiais, aspas,
+  travessões, reticências) e `sanitize_file()` para `.txt`/`.docx`/`.pdf`, sempre com
+  relatório do que mudou. No `.docx` limpa texto dos runs, `docProps/core.xml` e
+  `app.xml`, autoria de revisões/comentários e datas do zip; no PDF só `/Info` + XMP
+  (o texto do PDF não é reescrito — o relatório avisa).
+- `services/humanizer.py` — `humanize(text, paid=, tone=)`: chunks de parágrafos
+  inteiros (~600 palavras; parágrafo maior é dividido por frase), chunks em paralelo
+  (4 threads), `max_tokens` estourado → divide o chunk e refaz. `HumanizeError` tem
+  `retryable` para o worker decidir entre retry e estorno. Opções de thinking/effort
+  por família de modelo em `_model_options()` (Haiku 4.5 recusa `effort`; Sonnet 5.5
+  recusa `disabled`). Testado com cliente falso — **ainda não rodou contra a API**.
+  O system prompt tem ~650 tokens, abaixo do mínimo de cache do Sonnet 5 (1.024):
+  o `cache_control` está lá, mas hoje não tem efeito.
 - `api/v1/auth.py`: signup, login, refresh (com rotação), logout, me
 - `main.py` + `/health`
 - **Alembic**: `alembic.ini`, `alembic/env.py`, `script.py.mako` e a migration
@@ -109,26 +126,13 @@ dá: `alembic check`, qualquer teste que toque o banco, e o Celery.
   **não foi aplicada em banco de verdade** — falta rodar contra o Postgres.
 
 **Falta**
-1. `services/extract.py` — `.docx` / `.pdf` / `.txt` → texto. *Próximo passo.*
-2. `services/sanitize.py` — limpeza de vestígios do arquivo (ver abaixo)
-3. `services/humanizer.py` — pipeline de reescrita com Claude
-4. `services/detector.py` — perplexidade + burstiness
-5. `worker/` — Celery app e tasks
-6. `api/v1/`: documents, humanize, detect, billing (webhook Stripe)
-7. `apps/web/` — dashboard React inteiro
-8. Testes
+1. `services/detector.py` — perplexidade + burstiness. *Próximo passo.*
+2. `worker/` — Celery app e tasks
+3. `api/v1/`: documents, humanize, detect, billing (webhook Stripe)
+4. `apps/web/` — dashboard React inteiro
+5. Testes dos demais serviços
 
 ### Notas de implementação para o que falta
-
-**`sanitize.py`** — é a parte mais determinística e a de maior retorno, porque não
-gasta token: remover zero-width (`U+200B`, `U+200C`, `U+FEFF`), normalizar aspas
-curvas e travessões, limpar `docProps/core.xml` do `.docx` (`author`,
-`lastModifiedBy`, `created`, `modified`, `revision`) e o `/Info` + XMP do PDF.
-
-**`humanizer.py`** — quebre por parágrafo, não por caractere: cortar no meio de uma
-frase destrói a coerência. O system prompt é estável entre requisições, então marque
-`cache_control={"type": "ephemeral"}` (só entra em vigor acima do prefixo mínimo
-do modelo). Nunca truncar entrada em silêncio: se não couber, chunk.
 
 **`detector.py`** — os pesos do classificador precisam ser calibrados contra um
 corpus rotulado em PT-BR. Qualquer peso que entre no código antes disso é um chute

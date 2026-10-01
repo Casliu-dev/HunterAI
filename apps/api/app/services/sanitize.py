@@ -1,0 +1,260 @@
+"""Limpeza de vestígios do arquivo: caracteres invisíveis, tipografia colada e metadados.
+
+É determinístico e não gasta token. Devolve sempre um relatório do que mudou, para
+o dashboard mostrar ("removemos 12 caracteres invisíveis e o nome do autor") — o
+usuário precisa saber o que foi alterado no arquivo dele.
+
+Por formato:
+- `.txt`  → texto limpo, sempre devolvido em UTF-8.
+- `.docx` → texto dos runs limpo (corpo, cabeçalho, rodapé, notas, comentários),
+            metadados de `docProps/` removidos, autor de revisões/comentários
+            anonimizado e datas das entradas do zip zeradas.
+- `.pdf`  → só metadados (`/Info` e XMP). O texto de um PDF fica em content
+            streams com fontes subsetadas; reescrevê-lo com segurança não é viável.
+"""
+
+import io
+import re
+import zipfile
+from dataclasses import asdict, dataclass, field
+
+from lxml import etree
+
+from app.services.extract import (
+    MAX_DOCX_UNCOMPRESSED_BYTES,
+    ExtractionError,
+    FileKind,
+    decode_text,
+    detect_kind,
+)
+
+# --- texto ----------------------------------------------------------------------
+
+# Invisíveis que não têm uso legítimo num trabalho em PT-BR: zero-width space e
+# non-joiner, word joiner, BOM no meio do texto, hífen condicional, marcas e
+# embeddings bidirecionais. O ZWJ (U+200D) é tratado à parte: ele compõe emoji.
+_INVISIBLE_RE = re.compile("[​‌⁠﻿­᠎‎‏‪-‮⁦-⁩]")
+_ZWJ_BETWEEN_LETTERS_RE = re.compile(r"(?<=\w)‍(?=\w)")
+# Espaço não separável, fino, de figura, etc. → espaço comum.
+_SPACES_RE = re.compile("[  -   　]")
+_DOUBLE_QUOTES_RE = re.compile("[“”„‟″]")
+_SINGLE_QUOTES_RE = re.compile("[‘’‚‛′]")
+# Travessão colado entre palavras ("texto—texto") ganha espaços; o resto vira hífen.
+# Entre dígitos ("1990–2000") fica sem espaço.
+_DASH_BETWEEN_WORDS_RE = re.compile(r"(?<=[^\W\d])[—―](?=[^\W\d])")
+_DASHES_RE = re.compile("[‒–—―]")
+_ELLIPSIS_RE = re.compile("…")
+
+
+@dataclass
+class TextChanges:
+    invisible_chars: int = 0
+    special_spaces: int = 0
+    quotes: int = 0
+    dashes: int = 0
+    ellipses: int = 0
+
+    def add(self, other: "TextChanges") -> None:
+        for name, value in asdict(other).items():
+            setattr(self, name, getattr(self, name) + value)
+
+    @property
+    def total(self) -> int:
+        return sum(asdict(self).values())
+
+
+def sanitize_text(text: str) -> tuple[str, TextChanges]:
+    changes = TextChanges()
+
+    text, n1 = _INVISIBLE_RE.subn("", text)
+    text, n2 = _ZWJ_BETWEEN_LETTERS_RE.subn("", text)
+    changes.invisible_chars = n1 + n2
+
+    text, changes.special_spaces = _SPACES_RE.subn(" ", text)
+
+    text, n1 = _DOUBLE_QUOTES_RE.subn('"', text)
+    text, n2 = _SINGLE_QUOTES_RE.subn("'", text)
+    changes.quotes = n1 + n2
+
+    text, n1 = _DASH_BETWEEN_WORDS_RE.subn(" - ", text)
+    text, n2 = _DASHES_RE.subn("-", text)
+    changes.dashes = n1 + n2
+
+    text, changes.ellipses = _ELLIPSIS_RE.subn("...", text)
+    return text, changes
+
+
+# --- relatório ------------------------------------------------------------------
+
+
+@dataclass
+class SanitizeReport:
+    text: TextChanges = field(default_factory=TextChanges)
+    metadata_removed: list[str] = field(default_factory=list)
+    authors_anonymized: int = 0
+    # O que NÃO foi feito e o usuário deveria saber (ex.: texto de PDF intocado).
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {**asdict(self), "text": {**asdict(self.text), "total": self.text.total}}
+
+
+@dataclass(frozen=True, slots=True)
+class SanitizedFile:
+    kind: FileKind
+    data: bytes
+    report: SanitizeReport
+
+
+def sanitize_file(data: bytes, filename: str = "") -> SanitizedFile:
+    """Limpa o arquivo e devolve os bytes novos. Levanta ExtractionError se inválido."""
+    kind = detect_kind(data, filename)
+    if kind is FileKind.DOCX:
+        out, report = _sanitize_docx(data)
+    elif kind is FileKind.PDF:
+        out, report = _sanitize_pdf(data)
+    else:
+        text, changes = sanitize_text(decode_text(data))
+        out, report = text.encode("utf-8"), SanitizeReport(text=changes)
+    return SanitizedFile(kind=kind, data=out, report=report)
+
+
+# --- docx -----------------------------------------------------------------------
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_TEXT_TAGS = {f"{{{W_NS}}}t", f"{{{W_NS}}}delText"}
+# Partes com texto do usuário e/ou autoria de revisões e comentários.
+_WORD_PARTS_RE = re.compile(
+    r"^word/(document|header\d*|footer\d*|footnotes|endnotes|comments\w*|people)\.xml$"
+)
+# Atributos de autoria em w:ins, w:del, w:comment e w15:person/presenceInfo
+# (este último guarda e-mail/ID da conta Microsoft).
+_AUTHOR_ATTRS = {"author", "initials", "userId", "providerId"}
+_ANONYMOUS = "Autor"
+
+# docProps/core.xml: quem criou, quem editou por último, quando, quantas vezes.
+# `description` é o campo "Comentários" das propriedades — geradores de .docx
+# costumam assinar ali ("generated by …"). Título e palavras-chave ficam.
+_CORE_FIELDS = {
+    "creator",
+    "lastModifiedBy",
+    "created",
+    "modified",
+    "revision",
+    "lastPrinted",
+    "description",
+}
+# docProps/app.xml: empresa, gestor, template de origem e minutos de edição.
+_APP_FIELDS = {"Company", "Manager", "Template", "TotalTime", "HyperlinkBase"}
+
+# Data mínima do formato zip: as entradas não carregam mais a hora em que o
+# arquivo foi gerado.
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+# Sem DTD/entidades: o XML vem do usuário (XXE e billion laughs).
+_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+
+
+def _sanitize_docx(data: bytes) -> tuple[bytes, SanitizeReport]:
+    report = SanitizeReport()
+    out = io.BytesIO()
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as src:
+            infos = src.infolist()
+            if sum(i.file_size for i in infos) > MAX_DOCX_UNCOMPRESSED_BYTES:
+                raise ExtractionError("O .docx é grande demais depois de descompactado.")
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+                for info in infos:
+                    content = src.read(info)
+                    if _WORD_PARTS_RE.match(info.filename):
+                        content = _clean_word_part(content, report)
+                    elif info.filename == "docProps/core.xml":
+                        content = _drop_fields(content, _CORE_FIELDS, report)
+                    elif info.filename == "docProps/app.xml":
+                        content = _drop_fields(content, _APP_FIELDS, report)
+                    new_info = zipfile.ZipInfo(info.filename, date_time=_ZIP_EPOCH)
+                    new_info.compress_type = info.compress_type
+                    new_info.external_attr = info.external_attr
+                    dst.writestr(new_info, content)
+    except (zipfile.BadZipFile, etree.XMLSyntaxError) as exc:
+        raise ExtractionError("Arquivo .docx corrompido: não foi possível abri-lo.") from exc
+    return out.getvalue(), report
+
+
+def _clean_word_part(content: bytes, report: SanitizeReport) -> bytes:
+    root = etree.fromstring(content, _XML_PARSER)
+    for el in root.iter():
+        if el.tag in _TEXT_TAGS and el.text:
+            el.text, changes = sanitize_text(el.text)
+            report.text.add(changes)
+        for attr in el.attrib:
+            if etree.QName(attr).localname in _AUTHOR_ATTRS and el.attrib[attr] not in (
+                "",
+                _ANONYMOUS,
+            ):
+                el.attrib[attr] = _ANONYMOUS
+                report.authors_anonymized += 1
+    return _serialize(root)
+
+
+def _drop_fields(content: bytes, fields: set[str], report: SanitizeReport) -> bytes:
+    root = etree.fromstring(content, _XML_PARSER)
+    for el in list(root):
+        name = etree.QName(el).localname
+        if name in fields:
+            root.remove(el)
+            if name not in report.metadata_removed:
+                report.metadata_removed.append(name)
+    return _serialize(root)
+
+
+def _serialize(root) -> bytes:
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+# --- pdf ------------------------------------------------------------------------
+
+
+def _sanitize_pdf(data: bytes) -> tuple[bytes, SanitizeReport]:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.errors import PdfReadError
+    from pypdf.generic import NameObject
+
+    report = SanitizeReport(
+        notes=["O texto dentro do PDF não é alterado; apenas os metadados são removidos."]
+    )
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise ExtractionError("O PDF está protegido por senha. Remova a senha e envie de novo.")
+        info = reader.metadata or {}
+        report.metadata_removed.extend(str(k).lstrip("/") for k in info)
+        writer = PdfWriter(clone_from=reader)
+    except ExtractionError:
+        raise
+    except (PdfReadError, ValueError, KeyError, TypeError) as exc:
+        raise ExtractionError("Arquivo PDF corrompido: não foi possível abri-lo.") from exc
+
+    # /Info do trailer (Author, Creator, Producer, datas…).
+    writer.metadata = None
+
+    # XMP: stream XML no catálogo e, às vezes, por página. /PieceInfo guarda dados
+    # privados do aplicativo que gerou o arquivo (Illustrator, Word…).
+    meta_key, piece_key = NameObject("/Metadata"), NameObject("/PieceInfo")
+    if meta_key in writer.root_object:
+        del writer.root_object[meta_key]
+        report.metadata_removed.append("XMP")
+    for page in writer.pages:
+        for key in (meta_key, piece_key):
+            if key in page:
+                del page[key]
+                if "Metadados por página" not in report.metadata_removed:
+                    report.metadata_removed.append("Metadados por página")
+
+    # O clone copia todos os objetos: sem isto, o stream XMP e o /Info continuam
+    # no arquivo como objetos órfãos — sem referência, mas legíveis nos bytes.
+    writer.compress_identical_objects(remove_duplicates=False, remove_unreferenced=True)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue(), report
