@@ -3,8 +3,6 @@
 SaaS de reescrita e análise de texto para estudantes — humanizador, limpeza de
 vestígios em arquivos e detector de IA, num dashboard só.
 
-> Arquitetura, decisões e estado do projeto: [`CLAUDE.md`](CLAUDE.md).
-
 ## Requisitos
 
 - Docker Desktop **ou** Python 3.12 + PostgreSQL 16 + Redis 7
