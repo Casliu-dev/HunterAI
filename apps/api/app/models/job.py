@@ -13,6 +13,7 @@ from app.models.base import Base, TimestampMixin
 class JobKind(StrEnum):
     HUMANIZE = "humanize"
     DETECT = "detect"
+    SANITIZE = "sanitize"
 
 
 class JobStatus(StrEnum):

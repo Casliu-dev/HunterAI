@@ -238,9 +238,14 @@ def _model_options(model: str) -> dict:
 
 @lru_cache
 def get_client() -> anthropic.Anthropic:
-    # api_key=None faz o SDK cair para ANTHROPIC_API_KEY / perfil do `ant`.
+    """Cria cliente Anthropic. Falha cedo se a chave não estiver configurada."""
+    api_key = settings.anthropic_api_key
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY não configurada. Defina no .env ou variável de ambiente."
+        )
     # 3 retries com backoff para 429/5xx/conexão; o timeout é por tentativa.
-    return anthropic.Anthropic(api_key=settings.anthropic_api_key, max_retries=3, timeout=120.0)
+    return anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=120.0)
 
 
 def _call(client: anthropic.Anthropic, model: str, tone: Tone, text: str, usage: Usage) -> str:

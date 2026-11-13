@@ -22,7 +22,7 @@ from app.schemas.auth import (
 )
 from app.services import credits
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(tags=["auth"])
 
 
 def _issue_tokens(db: DbSession, user: User) -> TokenPair:
@@ -44,7 +44,7 @@ def _issue_tokens(db: DbSession, user: User) -> TokenPair:
     )
 
 
-@router.post("/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
+@router.post("/auth/signup", response_model=TokenPair, status_code=status.HTTP_201_CREATED)
 def signup(payload: SignupRequest, db: DbSession) -> TokenPair:
     email = payload.email.lower().strip()
 
@@ -66,7 +66,7 @@ def signup(payload: SignupRequest, db: DbSession) -> TokenPair:
     return _issue_tokens(db, user)
 
 
-@router.post("/login", response_model=TokenPair)
+@router.post("/auth/login", response_model=TokenPair)
 def login(payload: LoginRequest, db: DbSession) -> TokenPair:
     email = payload.email.lower().strip()
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
@@ -80,7 +80,7 @@ def login(payload: LoginRequest, db: DbSession) -> TokenPair:
     return _issue_tokens(db, user)
 
 
-@router.post("/refresh", response_model=TokenPair)
+@router.post("/auth/refresh", response_model=TokenPair)
 def refresh(payload: RefreshRequest, db: DbSession) -> TokenPair:
     token_hash = hash_refresh_token(payload.refresh_token)
     stored = db.execute(
@@ -99,7 +99,7 @@ def refresh(payload: RefreshRequest, db: DbSession) -> TokenPair:
     return _issue_tokens(db, user)
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(payload: RefreshRequest, db: DbSession) -> None:
     token_hash = hash_refresh_token(payload.refresh_token)
     stored = db.execute(
@@ -110,7 +110,7 @@ def logout(payload: RefreshRequest, db: DbSession) -> None:
         db.commit()
 
 
-@router.get("/me", response_model=MeOut)
+@router.get("/auth/me", response_model=MeOut)
 def me(user: CurrentUser, db: DbSession) -> MeOut:
     return MeOut(
         id=user.id,
